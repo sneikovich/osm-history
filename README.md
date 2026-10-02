@@ -1,6 +1,6 @@
 # history
 
-Журнал запитів до [overpass-api-fetcher](../overpass-api-fetcher/README.md) у PostgreSQL. Сервіс єдиний пише в БД. Події приймає по HTTP від `overpass-server` (fire-and-forget), stateless, скейлиться репліками.
+Журнал запитів до [overpass-api-fetcher](../osm-fetcher/README.md) у PostgreSQL. Сервіс єдиний пише в БД. Події приймає по HTTP від `overpass-server` (fire-and-forget), stateless, скейлиться репліками.
 
 ```
 fetcher ──POST /events──► history ──► postgres
