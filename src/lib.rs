@@ -1,5 +1,6 @@
 //! Query log for the Overpass fetcher: `POST /events` stores one query, `GET /healthz` checks the DB.
 
+pub mod consumer;
 pub mod ua;
 
 use axum::Router;
@@ -110,17 +111,21 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
-async fn record(State(pool): State<PgPool>, body: Result<Json<Event>, JsonRejection>) -> Response {
-    let ev = match body {
-        Ok(Json(ev)) => ev,
-        Err(e) => return error(e.status(), e.body_text()),
-    };
-    if let Err(msg) = ev.validate() {
-        return error(StatusCode::UNPROCESSABLE_ENTITY, msg);
-    }
+/// Why [`store`] refused an event.
+#[derive(Debug)]
+pub enum StoreError {
+    /// The event is malformed; retrying will not help.
+    Invalid(String),
+    /// The database failed; the event may be retried.
+    Db(sqlx::Error),
+}
+
+/// Validate an event and insert it into `queries`.
+pub async fn store(pool: &PgPool, ev: &Event) -> Result<(), StoreError> {
+    ev.validate().map_err(StoreError::Invalid)?;
     let (os, browser) = ev.user_agent.as_deref().map_or((None, None), ua::parse);
 
-    let res = sqlx::query(
+    sqlx::query(
         "INSERT INTO queries \
          (tags, area_type, coords, kind, status, element_count, duration_ms, client_os, client_browser) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -134,12 +139,21 @@ async fn record(State(pool): State<PgPool>, body: Result<Json<Event>, JsonReject
     .bind(ev.duration_ms.min(i32::MAX as u32) as i32)
     .bind(os)
     .bind(browser)
-    .execute(&pool)
-    .await;
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(StoreError::Db)
+}
 
-    match res {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
+async fn record(State(pool): State<PgPool>, body: Result<Json<Event>, JsonRejection>) -> Response {
+    let ev = match body {
+        Ok(Json(ev)) => ev,
+        Err(e) => return error(e.status(), e.body_text()),
+    };
+    match store(&pool, &ev).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(StoreError::Invalid(msg)) => error(StatusCode::UNPROCESSABLE_ENTITY, msg),
+        Err(StoreError::Db(e)) => {
             eprintln!("insert failed: {e}");
             error(StatusCode::SERVICE_UNAVAILABLE, "database unavailable")
         }
