@@ -1,9 +1,9 @@
 # history
 
-Журнал запитів до [osm-fetcher](../osm-fetcher/README.md) у PostgreSQL. Сервіс єдиний пише в БД. Події приймає по HTTP від `overpass-server` (fire-and-forget), stateless, скейлиться репліками.
+Журнал запитів до [osm-fetcher](../osm-fetcher/README.md) у PostgreSQL. Сервіс єдиний пише в БД. Події надходять від `overpass-server` через RabbitMQ (черга `history.events`), також приймаються по HTTP (`POST /events`). Stateless, скейлиться репліками (конкуруючі споживачі однієї черги).
 
 ```
-fetcher ──POST /events──► history ──► postgres
+fetcher ──► rabbitmq (history.events) ──► history ──► postgres
 ```
 
 ## Збірка й тести
@@ -28,10 +28,20 @@ DATABASE_URL=postgres://history:test@127.0.0.1:55432/history cargo run
 | `DATABASE_URL` | `--database-url` | обов'язкова |
 | `HISTORY_LISTEN` | `--listen` | `0.0.0.0:8081` |
 | `HISTORY_CONNECT_WAIT` | `--connect-wait` | `30` с: скільки чекати БД на старті |
+| `RABBITMQ_URL` | `--rabbitmq-url` | не задано: споживач вимкнений (лише HTTP), напр. `amqp://app:app@rabbitmq:5672/%2f` |
 
 На старті сервіс застосовує міграції з `migrations/`. Вони вбудовані в бінарник і виконуються під advisory lock, тому кілька реплік одночасно стартують безпечно. Сервер коректно завершується по SIGTERM/SIGINT.
 
-Фетчер вмикає відправку подій через `HISTORY_URL=http://history:8081`.
+### RabbitMQ
+
+Якщо задано `RABBITMQ_URL`, сервіс споживає durable-чергу `history.events` (повідомлення — той самий JSON, що й у `POST /events`), `prefetch` 20, ручний ack:
+
+- успішно записано → `ack`;
+- нечитабельний JSON або не пройшла валідація → `nack` без requeue, повідомлення потрапляє в `history.events.dead`;
+- БД недоступна → повідомлення лишається без ack, вставка повторюється щойно БД повернеться (решта подій чекає в черзі);
+- обрив з'єднання з брокером → перепідключення кожні 2 с.
+
+Обидві черги оголошує і history, і fetcher; аргументи оголошення (`x-dead-letter-*`) мають збігатися, інакше брокер відхилить redeclare.
 
 ## API
 

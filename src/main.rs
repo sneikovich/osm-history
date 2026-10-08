@@ -19,6 +19,10 @@ struct Cli {
     /// How long to keep retrying the initial DB connection, seconds
     #[arg(long, env = "HISTORY_CONNECT_WAIT", default_value_t = 30)]
     connect_wait: u64,
+
+    /// amqp://user:password@host/vhost; unset disables the RabbitMQ consumer
+    #[arg(long, env = "RABBITMQ_URL", hide_env_values = true)]
+    rabbitmq_url: Option<String>,
 }
 
 /// Postgres is often still starting when the stack comes up; keep trying for a while.
@@ -76,10 +80,26 @@ async fn main() -> ExitCode {
     };
     eprintln!("listening on {}", cli.listen);
 
-    if let Err(e) = axum::serve(listener, history::router(pool))
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let consumer = cli.rabbitmq_url.map(|url| {
+        let pool = pool.clone();
+        let mut stop = stop_rx.clone();
+        tokio::spawn(async move {
+            let stopped = async move {
+                let _ = stop.wait_for(|s| *s).await;
+            };
+            history::consumer::run(&url, pool, stopped).await;
+        })
+    });
+
+    let served = axum::serve(listener, history::router(pool))
         .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
+        .await;
+    let _ = stop_tx.send(true);
+    if let Some(task) = consumer {
+        let _ = task.await;
+    }
+    if let Err(e) = served {
         eprintln!("error: {e}");
         return ExitCode::FAILURE;
     }
